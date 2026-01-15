@@ -10,12 +10,19 @@ import urllib.parse
 
 try:
     import requests
-    from tqdm import tqdm
-    import colorama
-    colorama.init(autoreset=True)  # 启用 Windows ANSI 支持
+    from rich.console import Console
+    from rich.live import Live
+    from rich.progress import (Progress, SpinnerColumn, TextColumn,
+                                BarColumn, TaskProgressColumn, TimeRemainingColumn,
+                                DownloadColumn, TransferSpeedColumn)
+    from rich.text import Text
+    from rich.columns import Columns
 except ImportError:
-    print("请安装依赖库: pip install requests tqdm colorama")
+    print("请安装依赖库: pip install requests rich")
     exit(1)
+
+# 初始化 rich 控制台
+console = Console()
 
 current_frame = inspect.currentframe()
 if current_frame is None:
@@ -27,14 +34,10 @@ root = os.path.dirname(os.path.abspath(current_file))
 PREFIX = "https://dos-bin.zczc.cz/"
 DESTINATION = os.path.join(root, 'bin')
 BUF_SIZE = 65536
-THREAD_SIZE = 2
+THREAD_SIZE = 4
 TIMEOUT = 30  # 请求超时时间（秒）
 MAX_RETRIES = 3  # 最大重试次数
 RETRY_DELAY = 2  # 重试延迟（秒）
-
-# 启用 ANSI 支持以正确显示进度条
-os.environ['FORCE_COLOR'] = '1'
-os.environ['PYTHONUNBUFFERED'] = '1'  # 确保 Python 输出不缓冲
 
 # 下载统计信息
 download_stats = {
@@ -44,7 +47,6 @@ download_stats = {
     'total_size': 0,
     'start_time': None,
     'end_time': None,
-    'position': 0,
 }
 
 # 读取游戏信息
@@ -71,12 +73,12 @@ def generate_sha256(file_path: str) -> Optional[str]:
                 sha256.update(data)
         return sha256.hexdigest()
     except (IOError, OSError) as e:
-        print(f"警告: 无法读取文件 {file_path} - {e}")
+        console.print(f"[yellow]警告: 无法读取文件 {file_path} - {e}[/yellow]")
         return None
 
 
 def download_with_retry(identifier: str, url: str, file_path: str,
-                        retry_count: int = MAX_RETRIES, position: int = 0) -> Tuple[bool, Optional[str]]:
+                        retry_count: int = MAX_RETRIES, progress: Optional[Progress] = None) -> Tuple[bool, Optional[str]]:
     """
     带重试机制和断点续传的下载函数
 
@@ -85,7 +87,7 @@ def download_with_retry(identifier: str, url: str, file_path: str,
         url: 下载地址
         file_path: 保存路径
         retry_count: 重试次数
-        position: 进度条位置
+        progress: rich 进度条对象
 
     Returns:
         (成功状态, 错误信息)
@@ -132,32 +134,37 @@ def download_with_retry(identifier: str, url: str, file_path: str,
                 response = requests.get(url, stream=True, timeout=TIMEOUT)
                 response.raise_for_status()
 
+            # 创建任务 ID
+            task_id = f"[cyan]{identifier}[/cyan]"
+
             # 打开文件并下载
-            with open(temp_file, mode) as f, tqdm(
-                desc=f"{identifier}",
-                total=total_size,
-                initial=downloaded_size,
-                unit='B',
-                unit_scale=True,
-                unit_divisor=1024,
-                position=position,
-                leave=True,
-                ncols=80,
-                disable=False,
-                ascii=None  # 使用 Unicode 字符
-            ) as pbar:
+            with open(temp_file, mode) as f:
+                if progress is not None:
+                    # 使用 rich 进度条
+                    task = progress.add_task(
+                        task_id,
+                        total=total_size,
+                        completed=downloaded_size
+                    )
+                else:
+                    task = None
+
                 for chunk in response.iter_content(chunk_size=BUF_SIZE):
                     # 检查是否收到中断信号
                     if download_stats.get('interrupt', False):
                         response.close()
-                        pbar.close()
+                        if task is not None and progress is not None:
+                            progress.remove_task(task)
                         return False, "用户中断下载"
 
                     if chunk:
                         f.write(chunk)
                         downloaded_size += len(chunk)
-                        pbar.update(len(chunk))
-                pbar.close()
+                        if task is not None and progress is not None:
+                            progress.update(task, advance=len(chunk))
+
+                if task is not None and progress is not None:
+                    progress.remove_task(task)
 
             # 重命名为正式文件
             os.replace(temp_file, file_path)
@@ -171,8 +178,8 @@ def download_with_retry(identifier: str, url: str, file_path: str,
         except requests.exceptions.RequestException as e:
             error_msg = str(e)
             if attempt < retry_count:
-                print(f"下载失败 ({attempt + 1}/{retry_count}): {identifier} - {error_msg}")
-                print(f"等待 {RETRY_DELAY} 秒后重试...")
+                console.print(f"[red]下载失败 ({attempt + 1}/{retry_count}): {identifier} - {error_msg}[/red]")
+                console.print(f"[yellow]等待 {RETRY_DELAY} 秒后重试...[/yellow]")
                 time.sleep(RETRY_DELAY)
             else:
                 return False, error_msg
@@ -180,8 +187,8 @@ def download_with_retry(identifier: str, url: str, file_path: str,
         except Exception as e:
             error_msg = f"未知错误: {str(e)}"
             if attempt < retry_count:
-                print(f"下载失败 ({attempt + 1}/{retry_count}): {identifier} - {error_msg}")
-                print(f"等待 {RETRY_DELAY} 秒后重试...")
+                console.print(f"[red]下载失败 ({attempt + 1}/{retry_count}): {identifier} - {error_msg}[/red]")
+                console.print(f"[yellow]等待 {RETRY_DELAY} 秒后重试...[/yellow]")
                 time.sleep(RETRY_DELAY)
             else:
                 return False, error_msg
@@ -197,7 +204,7 @@ def verify_file(file_path: str, expected_sha256: str) -> bool:
     return actual_sha256 == expected_sha256
 
 
-def download(identifier: str, url: str, file_path: str, position: int = 0) -> Tuple[bool, str]:
+def download(identifier: str, url: str, file_path: str, progress: Optional[Progress] = None) -> Tuple[bool, str]:
     """
     下载单个游戏文件
 
@@ -205,7 +212,7 @@ def download(identifier: str, url: str, file_path: str, position: int = 0) -> Tu
         identifier: 游戏标识符
         url: 下载地址
         file_path: 保存路径
-        position: 进度条位置
+        progress: rich 进度条对象
 
     Returns:
         (成功状态, 消息)
@@ -218,7 +225,7 @@ def download(identifier: str, url: str, file_path: str, position: int = 0) -> Tu
             return True, f"已存在且校验通过: {identifier}"
 
     # 下载文件
-    success, error_msg = download_with_retry(identifier, url, file_path, position)
+    success, error_msg = download_with_retry(identifier, url, file_path, progress=progress)
 
     if success:
         # 下载后再次校验
@@ -251,25 +258,24 @@ def format_size(size_bytes: int) -> str:
 
 def print_summary(downloaded: List[str]):
     """打印下载摘要"""
-    print("\n" + "=" * 60)
-    print("下载完成!")
-    print("=" * 60)
+    console.print("\n[bold cyan]下载完成![/bold cyan]")
+    console.print("=" * 50)
 
     elapsed_time = download_stats['end_time'] - download_stats['start_time']
     speed = download_stats['total_size'] / elapsed_time / 1024 / 1024 if elapsed_time > 0 else 0
 
-    print(f"总游戏数: {len(game_infos['games'])}")
-    print(f"下载成功: {download_stats['success']}")
-    print(f"跳过 (已存在): {download_stats['skipped']}")
-    print(f"失败: {download_stats['failed']}")
-    print(f"下载总量: {format_size(download_stats['total_size'])}")
-    print(f"平均速度: {speed:.2f} MB/s")
-    print(f"耗时: {elapsed_time:.2f} 秒")
+    console.print(f"总游戏数: {len(game_infos['games'])}")
+    console.print(f"[green]下载成功: {download_stats['success']}[/green]")
+    console.print(f"[yellow]跳过 (已存在): {download_stats['skipped']}[/yellow]")
+    console.print(f"[red]失败: {download_stats['failed']}[/red]")
+    console.print(f"下载总量: {format_size(download_stats['total_size'])}")
+    console.print(f"平均速度: {speed:.2f} MB/s")
+    console.print(f"耗时: {elapsed_time:.2f} 秒")
 
     if download_stats['failed'] > 0:
-        print("\n⚠️  有游戏下载失败，建议重新运行脚本")
+        console.print("\n[yellow]⚠ 有游戏下载失败，建议重新运行脚本[/yellow]")
     else:
-        print("\n✅ 所有游戏下载完成!")
+        console.print("\n[green]✅ 所有游戏下载完成![/green]")
 
 
 def check_network_connection() -> bool:
@@ -283,12 +289,12 @@ def check_network_connection() -> bool:
 
 def main(prefix: str = PREFIX, destination: str = DESTINATION):
     """主函数"""
-    print("中文 DOS 游戏下载器")
-    print("=" * 60)
+    console.print("[bold cyan]中文 DOS 游戏下载器[/bold cyan]")
+    console.print("=" * 50)
 
     # 检查网络连接
     if not check_network_connection():
-        print("❌ 错误: 无法连接到服务器，请检查网络连接")
+        console.print("[red]错误: 无法连接到服务器，请检查网络连接[/red]")
         return []
 
     # 创建目标文件夹
@@ -310,13 +316,36 @@ def main(prefix: str = PREFIX, destination: str = DESTINATION):
         task_queue.put((identifier, url, file_path))
 
     total_tasks = task_queue.qsize()
-    print(f"准备下载 {total_tasks} 个游戏...")
+    console.print(f"准备下载 {total_tasks} 个游戏...")
 
-    # 使用线程池下载
-    def worker():
-        """工作线程函数"""
-        while True:
-            try:
+    # 创建游戏下载进度条
+    progress = Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        console=console,
+        expand=True
+    )
+
+    # 用于显示总进度的函数
+    def get_overall_progress():
+        completed = download_stats['success'] + download_stats['skipped']
+        return Text.assemble(
+            ("总进度: ", "bold cyan"),
+            (f"{completed}/{total_tasks}", "bold green")
+        )
+
+    # 使用 Live 显示总进度和游戏下载进度条
+    from rich.console import Group
+    with Live(Group(get_overall_progress(), progress), console=console, refresh_per_second=10) as live:
+
+        # 使用线程池下载
+        def worker():
+            """工作线程函数"""
+            while True:
                 # 检查是否收到中断信号
                 if download_stats.get('interrupt', False):
                     break
@@ -329,59 +358,58 @@ def main(prefix: str = PREFIX, destination: str = DESTINATION):
                         break
                     continue
 
-                # 为每个任务分配递增的 position
-                position = download_stats['position'] + 1
-                download_stats['position'] = position
-                success, message = download(identifier, url, file_path, position)
+                success, message = download(identifier, url, file_path, progress)
                 if success:
                     downloaded.append(identifier)
                 else:
                     failed_list.append((identifier, message))
 
+                # 更新 Live 显示
+                live.update(Group(get_overall_progress(), progress))
+
                 task_queue.task_done()
 
-            except KeyboardInterrupt:
-                download_stats['interrupt'] = True
-                break
-            except Exception as e:
-                task_queue.task_done()
-                # 不要在异常处理中访问可能未定义的变量
-                pass
+        # 启动工作线程
+        futures = []
 
-    # 启动工作线程
-    futures = []
-
-    try:
-        with ThreadPoolExecutor(max_workers=THREAD_SIZE) as executor:
-            # 启动工作线程
-            for i in range(THREAD_SIZE):
-                future = executor.submit(worker)
-                futures.append(future)
-
-            # 等待所有任务完成
-            task_queue.join()
-
-            # 等待所有工作线程结束
-            for future in futures:
-                future.result()
-
-    except KeyboardInterrupt:
-        print("\n\n⚠️  检测到 Ctrl+C，正在停止下载...")
-        download_stats['interrupt'] = True
-        print(f"已下载 {len(downloaded)} 个游戏")
-        print(f"已跳过 {download_stats['skipped']} 个游戏")
-        print(f"失败 {download_stats['failed']} 个游戏")
-        print("正在等待正在下载的任务完成...")
-
-        # 等待正在进行的任务
         try:
-            for future in futures:
-                future.result(timeout=2)
-        except:
-            pass
+            with ThreadPoolExecutor(max_workers=THREAD_SIZE) as executor:
+                # 启动工作线程
+                for i in range(THREAD_SIZE):
+                    future = executor.submit(worker)
+                    futures.append(future)
 
-        print("您可以重新运行脚本继续下载")
-        return downloaded
+                # 等待所有任务完成
+                task_queue.join()
+
+                # 等待所有工作线程结束
+                for future in futures:
+                    future.result()
+
+        except KeyboardInterrupt:
+            console.print("\n\n[yellow]检测到 Ctrl+C，正在停止下载...[/yellow]")
+            download_stats['interrupt'] = True
+            console.print(f"已下载 [cyan]{len(downloaded)}[/cyan] 个游戏")
+            console.print(f"已跳过 [yellow]{download_stats['skipped']}[/yellow] 个游戏")
+            console.print(f"失败 [red]{download_stats['failed']}[/red] 个游戏")
+            console.print("正在等待正在下载的任务完成...")
+
+            # 等待正在进行的任务
+            for future in futures:
+                try:
+                    future.result(timeout=2)
+                except:
+                    pass
+
+            console.print("您可以重新运行脚本继续下载")
+            return downloaded
+
+    # 记录结束时间
+    download_stats['end_time'] = time.time()
+
+    # 打印摘要
+    print_summary(downloaded)
+    return downloaded
 
 
 if __name__ == '__main__':
